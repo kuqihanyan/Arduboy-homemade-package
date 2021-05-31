@@ -18,7 +18,6 @@
 
 #include "USBAPI.h"
 #include <avr/wdt.h>
-#include <avr/power.h>
 #include <util/atomic.h>
 
 #if defined(USBCON)
@@ -35,18 +34,14 @@ typedef struct
 static volatile LineInfo _usbLineInfo = { 57600, 0x00, 0x00, 0x00, 0x00 };
 static volatile int32_t breakValue = -1;
 
-#ifndef ARDUBOY_CORE
-bool _updatedLUFAbootloader = false;
-#else
-extern volatile unsigned char bootloader_timer;
-#endif
+static u8 wdtcsr_save;
 
 #define WEAK __attribute__ ((weak))
 
 extern const CDCDescriptor _cdcInterface PROGMEM;
 const CDCDescriptor _cdcInterface =
 {
-	D_IAD(0,2,CDC_COMMUNICATION_INTERFACE_CLASS,CDC_ABSTRACT_CONTROL_MODEL,1),
+	D_IAD(0,2,CDC_COMMUNICATION_INTERFACE_CLASS,CDC_ABSTRACT_CONTROL_MODEL,0),
 
 	//	CDC communication interface
 	D_INTERFACE(CDC_ACM_INTERFACE,1,CDC_COMMUNICATION_INTERFACE_CLASS,CDC_ABSTRACT_CONTROL_MODEL,0),
@@ -61,6 +56,11 @@ const CDCDescriptor _cdcInterface =
 	D_ENDPOINT(USB_ENDPOINT_OUT(CDC_ENDPOINT_OUT),USB_ENDPOINT_TYPE_BULK,USB_EP_SIZE,0),
 	D_ENDPOINT(USB_ENDPOINT_IN (CDC_ENDPOINT_IN ),USB_ENDPOINT_TYPE_BULK,USB_EP_SIZE,0)
 };
+
+bool isLUFAbootloader()
+{
+	return pgm_read_word(FLASHEND - 1) == NEW_LUFA_SIGNATURE;
+}
 
 int CDC_GetInterface(u8* interfaceNum)
 {
@@ -97,71 +97,65 @@ bool CDC_Setup(USBSetup& setup)
 		if (CDC_SET_CONTROL_LINE_STATE == r)
 		{
 			_usbLineInfo.lineState = setup.wValueL;
-		}
 
-		if (CDC_SET_LINE_CODING == r || CDC_SET_CONTROL_LINE_STATE == r)
-		{
 			// auto-reset into the bootloader is triggered when the port, already 
 			// open at 1200 bps, is closed.  this is the signal to start the watchdog
 			// with a relatively long period so it can finish housekeeping tasks
 			// like servicing endpoints before the sketch ends
-#ifndef ARDUBOY_CORE
+
 			uint16_t magic_key_pos = MAGIC_KEY_POS;
 
 // If we don't use the new RAMEND directly, check manually if we have a newer bootloader.
 // This is used to keep compatible with the old leonardo bootloaders.
 // You are still able to set the magic key position manually to RAMEND-1 to save a few bytes for this check.
-	#if MAGIC_KEY_POS != (RAMEND-1)
+#if MAGIC_KEY_POS != (RAMEND-1)
 			// For future boards save the key in the inproblematic RAMEND
 			// Which is reserved for the main() return value (which will never return)
-			if (_updatedLUFAbootloader) {
+			if (isLUFAbootloader()) {
 				// horray, we got a new bootloader!
 				magic_key_pos = (RAMEND-1);
 			}
-	#endif
 #endif
+
 			// We check DTR state to determine if host port is open (bit 0 of lineState).
 			if (1200 == _usbLineInfo.dwDTERate && (_usbLineInfo.lineState & 0x01) == 0)
 			{
-#ifndef ARDUBOY_CORE
-	#if MAGIC_KEY_POS != (RAMEND-1)
-				// Backup ram value if its not a newer bootloader.
+#if MAGIC_KEY_POS != (RAMEND-1)
+				// Backup ram value if its not a newer bootloader and it hasn't already been saved.
 				// This should avoid memory corruption at least a bit, not fully
-				if (magic_key_pos != (RAMEND-1)) {
+				if (magic_key_pos != (RAMEND-1) && *(uint16_t *)magic_key_pos != MAGIC_KEY) {
 					*(uint16_t *)(RAMEND-1) = *(uint16_t *)magic_key_pos;
 				}
-	#endif
+#endif
 				// Store boot key
 				*(uint16_t *)magic_key_pos = MAGIC_KEY;
+				// Save the watchdog state in case the reset is aborted.
+				wdtcsr_save = WDTCSR;
 				wdt_enable(WDTO_120MS);
-#else
-				bootloader_timer = 120; //ms 
-				power_timer0_enable(); //power timer0 is disabled by flashlight/safemode in older Arduboy2 libraries
-#endif            
 			}
-			else
+			else if (*(uint16_t *)magic_key_pos == MAGIC_KEY)
 			{
-#ifndef ARDUBOY_CORE
 				// Most OSs do some intermediate steps when configuring ports and DTR can
 				// twiggle more than once before stabilizing.
-				// To avoid spurious resets we set the watchdog to 250ms and eventually
+				// To avoid spurious resets we set the watchdog to 120ms and eventually
 				// cancel if DTR goes back high.
+				// Cancellation is only done if an auto-reset was started, which is
+				// indicated by the magic key having been set.
 
-				wdt_disable();
 				wdt_reset();
-	#if MAGIC_KEY_POS != (RAMEND-1)
+				// Restore the watchdog state in case the sketch was using it.
+				WDTCSR |= (1<<WDCE) | (1<<WDE);
+				WDTCSR = wdtcsr_save;
+#if MAGIC_KEY_POS != (RAMEND-1)
 				// Restore backed up (old bootloader) magic key data
 				if (magic_key_pos != (RAMEND-1)) {
 					*(uint16_t *)magic_key_pos = *(uint16_t *)(RAMEND-1);
 				} else
-	#endif
+#endif
 				{
 				// Clean up RAMEND key
 					*(uint16_t *)magic_key_pos = 0x0000;
 				}
-#else
-				bootloader_timer = 0;
-#endif            
 			}
 		}
 		return true;
